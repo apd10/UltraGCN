@@ -43,7 +43,9 @@ import configparser
 import time
 import argparse
 from torch.utils.tensorboard import SummaryWriter
-
+import pdb
+from tqdm import tqdm
+from hashedEmbeddingBag import HashedEmbeddingBag
 
 def data_param_prepare(config_file):
 
@@ -51,6 +53,18 @@ def data_param_prepare(config_file):
     config.read(config_file)
 
     params = {}
+      
+    if config.has_option("Model", "use_robez"):
+        params["use_robez"] = config.getint('Model', 'use_robez')
+        params["robez_compression"]  = config.getfloat('Model', 'robez_compression')
+    else:
+        params["use_robez"] = False
+        params["robez_compression"] = 1.0
+    if config.has_option("Model", "chunk_size"):
+        params["chunk_size"] = config.getint("Model", "chunk_size")
+    else:
+        params["chunk_size"] = 8
+       
 
     embedding_dim = config.getint('Model', 'embedding_dim')
     params['embedding_dim'] = embedding_dim
@@ -286,15 +300,20 @@ class UltraGCN(nn.Module):
         self.gamma = params['gamma']
         self.lambda_ = params['lambda']
 
-        self.user_embeds = nn.Embedding(self.user_num, self.embedding_dim)
-        self.item_embeds = nn.Embedding(self.item_num, self.embedding_dim)
+        if params["use_robez"]:
+            self.user_embeds = HashedEmbeddingBag(self.user_num, self.embedding_dim, compression=params["robez_compression"], val_offset=0, uma_chunk_size=params["chunk_size"])
+            self.item_embeds = HashedEmbeddingBag(self.item_num, self.embedding_dim, compression=params["robez_compression"], val_offset=0, uma_chunk_size=params["chunk_size"])
+        else:
+            self.user_embeds = nn.Embedding(self.user_num, self.embedding_dim)
+            self.item_embeds = nn.Embedding(self.item_num, self.embedding_dim)
 
         self.constraint_mat = constraint_mat
         self.ii_constraint_mat = ii_constraint_mat
         self.ii_neighbor_mat = ii_neighbor_mat
 
         self.initial_weight = params['initial_weight']
-        self.initial_weights()
+        if self.initial_weight > 0:
+            self.initial_weights()
 
     def initial_weights(self):
         nn.init.normal_(self.user_embeds.weight, std=self.initial_weight)
@@ -353,12 +372,12 @@ class UltraGCN(nn.Module):
     def norm_loss(self):
         loss = 0.0
         for parameter in self.parameters():
-            loss += torch.sum(parameter ** 2)
+            if parameter.requires_grad:
+                loss += torch.sum(parameter ** 2)
         return loss / 2
 
     def forward(self, users, pos_items, neg_items):
         omega_weight = self.get_omegas(users, pos_items, neg_items)
-        
         loss = self.cal_loss_L(users, pos_items, neg_items, omega_weight)
         loss += self.gamma * self.norm_loss()
         loss += self.lambda_ * self.cal_loss_I(users, pos_items)
@@ -391,7 +410,8 @@ def train(model, optimizer, train_loader, test_loader, mask, test_ground_truth_l
     if params['enable_tensorboard']:
         writer = SummaryWriter()
 
-    for epoch in range(params['max_epoch']):
+    for epoch in tqdm(range(params['max_epoch'])):
+        print(epoch, flush=True)
         model.train() 
         start_time = time.time()
 
@@ -424,8 +444,8 @@ def train(model, optimizer, train_loader, test_loader, mask, test_ground_truth_l
                 writer.add_scalar('Results/ndcg@20', NDCG, epoch)
             test_time = time.strftime("%H: %M: %S", time.gmtime(time.time() - start_time))
             
-            print('The time for epoch {} is: train time = {}, test time = {}'.format(epoch, train_time, test_time))
-            print("Loss = {:.5f}, F1-score: {:5f} \t Precision: {:.5f}\t Recall: {:.5f}\tNDCG: {:.5f}".format(loss.item(), F1_score, Precision, Recall, NDCG))
+            print('The time for epoch {} is: train time = {}, test time = {}'.format(epoch, train_time, test_time), flush=True)
+            print("Loss = {:.5f}, F1-score: {:5f} \t Precision: {:.5f}\t Recall: {:.5f}\tNDCG: {:.5f}".format(loss.item(), F1_score, Precision, Recall, NDCG), flush=True)
 
             if Recall > best_recall:
                 best_recall, best_ndcg, best_epoch = Recall, NDCG, epoch
@@ -536,7 +556,6 @@ def test(model, test_loader, test_ground_truth_list, mask, topk, n_user):
     users_list = []
     rating_list = []
     groundTrue_list = []
-
     with torch.no_grad():
         model.eval()
         for idx, batch_users in enumerate(test_loader):
@@ -544,7 +563,7 @@ def test(model, test_loader, test_ground_truth_list, mask, topk, n_user):
             batch_users = batch_users.to(model.get_device())
             rating = model.test_foward(batch_users) 
             rating = rating.cpu()
-            rating += mask[batch_users]
+            rating += mask[batch_users.cpu()]
             
             _, rating_K = torch.topk(rating, k=topk)
             rating_list.append(rating_K)
@@ -581,11 +600,19 @@ if __name__ == "__main__":
     print('Load Configuration OK, show them below')
     print('Configuration:')
     print(params)
+    for k,v in constraint_mat.items():
+        constraint_mat[k] = v.to(params['device'])
+
+    ii_constraint_mat = ii_constraint_mat.to(params['device'])
+
+    ii_neighbor_mat = ii_neighbor_mat.to(params['device'])
 
     ultragcn = UltraGCN(params, constraint_mat, ii_constraint_mat, ii_neighbor_mat)
+    print("Model")
+    print(ultragcn)
     ultragcn = ultragcn.to(params['device'])
     optimizer = torch.optim.Adam(ultragcn.parameters(), lr=params['lr'])
-
+    
     train(ultragcn, optimizer, train_loader, test_loader, mask, test_ground_truth_list, interacted_items, params)
 
     print('END')
