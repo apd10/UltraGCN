@@ -47,6 +47,34 @@ import pdb
 from tqdm import tqdm
 from hashedEmbeddingBag import HashedEmbeddingBag
 
+
+class UHasher:
+    def __init__(self, seed):
+        self.P = 15485863
+        gen = torch.Generator()
+        gen.manual_seed(seed)
+        rand = torch.randint(low=0, high=self.P, size=(3,))
+        self.A,self.B,self.C = rand[0], rand[1], rand[2]
+    def hash(self, tensor, m):
+        return (torch.square(tensor) * self.A + tensor * self.B +  self.C) % self.P % m
+
+
+class SCMAEmbedding(nn.Module):
+    def __init__(self, bag,  annotations):
+        super(SCMAEmbedding, self).__init__()
+        self.bag = bag
+        self.annotations = nn.Parameter(annotations, requires_grad=False)
+
+    def forward(self, x):
+        shape = x.shape
+        x = x.reshape(-1)
+        ann = self.annotations[x]
+        offset = torch.arange(ann.shape[0], device=x.device) * ann.shape[1]
+        emb = self.bag(ann.reshape(-1), offset)
+        emb = emb.reshape(*shape, -1)
+        return emb
+        
+
 def data_param_prepare(config_file):
 
     config = configparser.ConfigParser()
@@ -60,6 +88,16 @@ def data_param_prepare(config_file):
     else:
         params["use_robez"] = False
         params["robez_compression"] = 1.0
+
+    if config.has_option("Model", "use_scma"):
+        params["use_scma"] = config.getint('Model', 'use_scma')
+        params["scma_user_annotations"] = config['Model']['scma_user_annotations']
+        params["scma_item_annotations"] = config['Model']['scma_item_annotations']
+        params["scma_compression"] = config.getfloat('Model', 'scma_compression')
+    else:
+        params["use_scma"] = False
+    
+
     if config.has_option("Model", "chunk_size"):
         params["chunk_size"] = config.getint("Model", "chunk_size")
     else:
@@ -299,10 +337,30 @@ class UltraGCN(nn.Module):
         self.negative_weight = params['negative_weight']
         self.gamma = params['gamma']
         self.lambda_ = params['lambda']
+        self.params = params
 
         if params["use_robez"]:
             self.user_embeds = HashedEmbeddingBag(self.user_num, self.embedding_dim, compression=params["robez_compression"], val_offset=0, uma_chunk_size=params["chunk_size"])
             self.item_embeds = HashedEmbeddingBag(self.item_num, self.embedding_dim, compression=params["robez_compression"], val_offset=0, uma_chunk_size=params["chunk_size"])
+        elif params["use_scma"]:
+            user_ann = torch.LongTensor(np.loadtxt(params["scma_user_annotations"]).astype(int))
+            item_ann = torch.LongTensor(np.loadtxt(params["scma_item_annotations"]).astype(int))
+            print(">> ", user_ann.shape, item_ann.shape)
+
+            uhasher = UHasher(12344321)
+            lu = int(self.user_num * params["scma_compression"])
+            user_ann = uhasher.hash(user_ann, lu) 
+
+
+            uhasher = UHasher(23455432)
+            li = int(self.item_num * params["scma_compression"])
+            item_ann = uhasher.hash(item_ann, li)
+
+    
+            bag1 = torch.nn.EmbeddingBag(lu + 1, self.embedding_dim, mode="mean") # TODO memory efficient implementation
+            bag2 = torch.nn.EmbeddingBag(li + 1, self.embedding_dim, mode="mean") # TODO memory efficient implementation
+            self.user_embeds = SCMAEmbedding(bag1, user_ann)
+            self.item_embeds = SCMAEmbedding(bag2, item_ann)
         else:
             self.user_embeds = nn.Embedding(self.user_num, self.embedding_dim)
             self.item_embeds = nn.Embedding(self.item_num, self.embedding_dim)
@@ -316,8 +374,11 @@ class UltraGCN(nn.Module):
             self.initial_weights()
 
     def initial_weights(self):
-        nn.init.normal_(self.user_embeds.weight, std=self.initial_weight)
-        nn.init.normal_(self.item_embeds.weight, std=self.initial_weight)
+        if self.params['use_scma']:
+            nn.init.normal_(self.user_embeds.bag.weight, std=self.initial_weight)
+        else:
+            nn.init.normal_(self.user_embeds.weight, std=self.initial_weight)
+            nn.init.normal_(self.item_embeds.weight, std=self.initial_weight)
 
     def get_omegas(self, users, pos_items, neg_items):
         device = self.get_device()
@@ -391,7 +452,10 @@ class UltraGCN(nn.Module):
         return user_embeds.mm(item_embeds.t())
 
     def get_device(self):
-        return self.user_embeds.weight.device
+        if self.params["use_scma"]:
+            return self.user_embeds.bag.weight.device
+        else:
+            return self.user_embeds.weight.device
 
 
 ########################### TRAINING #####################################
@@ -411,7 +475,7 @@ def train(model, optimizer, train_loader, test_loader, mask, test_ground_truth_l
         writer = SummaryWriter()
 
     for epoch in tqdm(range(params['max_epoch'])):
-        print(epoch, flush=True)
+        print(flush=True)
         model.train() 
         start_time = time.time()
 
@@ -425,7 +489,11 @@ def train(model, optimizer, train_loader, test_loader, mask, test_ground_truth_l
             loss = model(users, pos_items, neg_items)
             if params['enable_tensorboard']:
                 writer.add_scalar("Loss/train_batch", loss, batches * epoch + batch)
+            #print(batch, "Loss", loss, flush=True)
             loss.backward()
+            #for name, mod in model.named_parameters():
+            #    if mod.requires_grad:
+            #        print(name, torch.sum(mod.grad))
             optimizer.step()
         
         train_time = time.strftime("%H: %M: %S", time.gmtime(time.time() - start_time))
@@ -455,7 +523,17 @@ def train(model, optimizer, train_loader, test_loader, mask, test_ground_truth_l
             else:
                 early_stop_count += 1
                 if early_stop_count == params['early_stop_epoch']:
-                    early_stop = True
+                    lr = params['lr']
+                    if lr > 1e-6:
+                        new_lr = lr * 0.3
+                        for g in optimizer.param_groups:
+                            g['lr'] = new_lr
+                        print("LR update:", new_lr)
+                        params['lr'] = new_lr
+                        early_stop_count = 0
+                    else:
+                        early_stop = True
+                
         
         if early_stop:
             print('##########################################')
